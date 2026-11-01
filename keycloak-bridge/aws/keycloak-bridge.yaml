@@ -1,0 +1,364 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  e10sso - Keycloak 桥接（E10 统一认证中心 -> Keycloak -> Amazon Quick Web/Desktop）。
+  PoC 规格：单台 EC2(t4g, Docker: Keycloak + PostgreSQL) + CloudFront(HTTPS)。
+  Keycloak 管理控制台不对公网开放，通过 SSM 端口转发访问。
+  E10 可以是 http（客户 E10 为 http + 20600），Keycloak 对外始终是 https。
+
+Parameters:
+  E10BaseUrl:
+    Type: String
+    AllowedPattern: '^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?$'
+    Description: E10 地址，含协议和端口，不带路径，例如 http://oa.example.com:20600（客户 E10 是 http + 20600）
+  E10Issuer:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(https?://[^\s"]+)?$'
+    Description: E10 id_token 里的 iss；留空则用 E10BaseUrl 本身（E10 的 issuer 就是访问地址：协议 + 域名:端口）。以服务发现里的 issuer 为准
+  E10ClientId:
+    Type: String
+    AllowedPattern: '^[A-Za-z0-9._-]+$'
+    Description: E10 认证应用的应用标识（业务系统 URL 填本栈输出的 E10RedirectUri）
+  E10ClientSecret:
+    Type: String
+    NoEcho: true
+    MinLength: 1
+    Description: E10 认证应用的应用密钥（存入 Secrets Manager）
+  E10Scopes:
+    Type: String
+    Default: openid email profile
+    AllowedPattern: '^[A-Za-z0-9_ :.-]+$'
+  EmailFrom:
+    Type: String
+    Default: email
+    AllowedValues: [email, sub]
+    Description: 用户邮箱取自 E10 id_token 的哪个 claim（email 没有时用 sub，E10 账号映射需设为电子邮箱）
+  NonceMode:
+    Type: String
+    Default: disable
+    AllowedValues: [disable, send]
+    Description: E10 id_token 不回传 nonce 时必须 disable
+  ArtifactBucket:
+    Type: String
+  ArtifactPrefix:
+    Type: String
+    Default: e10sso
+  CloudFrontPrefixListId:
+    Type: String
+  InstanceType:
+    Type: String
+    Default: t4g.medium
+    AllowedValues: [t4g.small, t4g.medium, t4g.large]
+  KeycloakImage:
+    Type: String
+    Default: quay.io/keycloak/keycloak:26.8.1
+  PostgresImage:
+    Type: String
+    Default: public.ecr.aws/docker/library/postgres:17-alpine
+  VpcCidr:
+    Type: String
+    Default: 10.89.0.0/24
+  AmiId:
+    Type: AWS::EC2::Image::Id
+    Description: >-
+      Amazon Linux 2023 arm64 AMI。deploy.sh 新建栈时取最新版，更新栈时沿用当前实例的 AMI，避免更新栈时实例被替换。
+      手工部署可用 aws ssm get-parameter --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64 查询
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-vpc'}]
+  Igw:
+    Type: AWS::EC2::InternetGateway
+  IgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: {VpcId: !Ref Vpc, InternetGatewayId: !Ref Igw}
+  Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref VpcCidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-public'}]
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref Vpc}
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttach
+    Properties: {RouteTableId: !Ref RouteTable, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref Igw}
+  SubnetRoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref Subnet, RouteTableId: !Ref RouteTable}
+  InstanceSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: keycloak - only CloudFront origin-facing IPs on 8080
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: 8080, ToPort: 8080, SourcePrefixListId: !Ref CloudFrontPrefixListId}
+  # 弹性 IP 先绑到网卡上再启动实例：实例停止再启动后公网 IP / 公网 DNS 不变，
+  # CloudFront 回源地址和 Keycloak 访问 E10 的出口 IP（客户白名单）都保持不变
+  Eip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}'}]
+  Eni:
+    Type: AWS::EC2::NetworkInterface
+    Properties:
+      SubnetId: !Ref Subnet
+      GroupSet: [!Ref InstanceSg]
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}'}]
+  EipAssoc:
+    Type: AWS::EC2::EIPAssociation
+    DependsOn: IgwAttach
+    Properties: {AllocationId: !GetAtt Eip.AllocationId, NetworkInterfaceId: !Ref Eni}
+
+  KcSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: !Sub '${AWS::StackName} - Keycloak 管理员密码、数据库密码（实例首次启动时生成）'
+      SecretString: '{"initialized":false}'
+  E10Secret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: !Sub '${AWS::StackName} - E10 认证应用的应用密钥'
+      SecretString: !Ref E10ClientSecret
+  E10ConfigParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/e10sso/${AWS::StackName}/e10-config'
+      Type: String
+      Description: Keycloak 对接 E10 的参数（configure.sh 读取）
+      Value: !Sub '{"base":"${E10BaseUrl}","issuer":"${E10Issuer}","client_id":"${E10ClientId}","scopes":"${E10Scopes}","email_from":"${EmailFrom}","nonce":"${NonceMode}"}'
+
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: sts:AssumeRole}]
+      ManagedPolicyArns: [!Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore']
+      Policies:
+        - PolicyName: e10sso-keycloak
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - {Effect: Allow, Action: s3:GetObject, Resource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/${ArtifactPrefix}/keycloak/*'}
+              - {Effect: Allow, Action: [secretsmanager:GetSecretValue, secretsmanager:PutSecretValue], Resource: !Ref KcSecret}
+              - {Effect: Allow, Action: secretsmanager:GetSecretValue, Resource: !Ref E10Secret}
+              - {Effect: Allow, Action: ssm:GetParameter,
+                 Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/e10sso/${AWS::StackName}/*'}
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: {Roles: [!Ref Role]}
+
+  WaitHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+
+  Instance:
+    Type: AWS::EC2::Instance
+    DependsOn: [DefaultRoute, E10ConfigParam, EipAssoc]
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      MetadataOptions: {HttpTokens: required, HttpEndpoint: enabled}
+      NetworkInterfaces:
+        - {DeviceIndex: '0', NetworkInterfaceId: !Ref Eni}
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs: {VolumeSize: 20, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true}
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}'}]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+          exec > /var/log/e10sso-bootstrap.log 2>&1
+          REGION=${AWS::Region}
+          HANDLE='${WaitHandle}'
+          report() { curl -s -X PUT -H 'Content-Type:' --data-binary "{\"Status\":\"$1\",\"Reason\":\"$2\",\"UniqueId\":\"keycloak\",\"Data\":\"$2\"}" "$HANDLE"; }
+          trap 'report FAILURE "bootstrap failed at line $LINENO, see /var/log/e10sso-bootstrap.log"; exit 1' ERR
+
+          dnf install -y docker jq
+          systemctl enable --now docker
+          docker pull ${PostgresImage}
+          docker pull ${KeycloakImage}
+
+          HOST=""
+          for i in $(seq 1 120); do
+            HOST=$(aws ssm get-parameter --region $REGION --name /e10sso/${AWS::StackName}/public-host --query Parameter.Value --output text 2>/dev/null) && break
+            sleep 10
+          done
+          [ -n "$HOST" ]
+
+          SID='${KcSecret}'
+          S=$(aws secretsmanager get-secret-value --region $REGION --secret-id "$SID" --query SecretString --output text)
+          if [ "$(echo "$S" | jq -r .initialized)" != "true" ]; then
+            S=$(jq -cn --arg a "$(openssl rand -hex 18)" --arg d "$(openssl rand -hex 18)" '{initialized:true, admin_password:$a, db_password:$d}')
+            aws secretsmanager put-secret-value --region $REGION --secret-id "$SID" --secret-string "$S" > /dev/null
+          fi
+          ADMIN_PW=$(echo "$S" | jq -r .admin_password)
+          DB_PW=$(echo "$S" | jq -r .db_password)
+
+          mkdir -p /opt/kc/pgdata
+          umask 077
+          printf 'POSTGRES_DB=keycloak\nPOSTGRES_USER=keycloak\nPOSTGRES_PASSWORD=%s\n' "$DB_PW" > /opt/kc/db.env
+          cat > /opt/kc/kc.env <<EOF
+          KC_DB=postgres
+          KC_DB_URL=jdbc:postgresql://kc-db:5432/keycloak
+          KC_DB_USERNAME=keycloak
+          KC_DB_PASSWORD=$DB_PW
+          KC_HOSTNAME=https://$HOST
+          KC_HOSTNAME_ADMIN=http://localhost:9080
+          KC_HTTP_ENABLED=true
+          KC_PROXY_HEADERS=forwarded
+          KC_HEALTH_ENABLED=true
+          KC_BOOTSTRAP_ADMIN_USERNAME=admin
+          KC_BOOTSTRAP_ADMIN_PASSWORD=$ADMIN_PW
+          EOF
+          sed -i 's/^ *//' /opt/kc/kc.env
+
+          docker network inspect kc > /dev/null 2>&1 || docker network create kc
+          docker rm -f kc-db keycloak > /dev/null 2>&1 || true
+          docker run -d --name kc-db --network kc --restart unless-stopped \
+            -v /opt/kc/pgdata:/var/lib/postgresql/data --env-file /opt/kc/db.env ${PostgresImage}
+          # 8080：CloudFront 回源（安全组只放行 CloudFront）；127.0.0.1:9080：管理控制台，只能本机或 SSM 端口转发访问
+          docker run -d --name keycloak --network kc --restart unless-stopped -p 8080:8080 -p 127.0.0.1:9080:8080 \
+            --env-file /opt/kc/kc.env ${KeycloakImage} start
+          for i in $(seq 1 90); do curl -sf -o /dev/null http://localhost:8080/realms/master/.well-known/openid-configuration && break; sleep 5; done
+          curl -sf -o /dev/null http://localhost:8080/realms/master/.well-known/openid-configuration
+
+          aws s3 cp --region $REGION s3://${ArtifactBucket}/${ArtifactPrefix}/keycloak/setup-keycloak.py /opt/kc/setup-keycloak.py
+          # configure.sh：重复执行配置（注册 IAM Identity Center 的 SP 元数据、修改 E10 参数后都用它）
+          #   用法：/opt/kc/configure.sh [SP元数据文件|none] [setup-keycloak.py 的其他参数]
+          #   E10 参数从 SSM 参数 /e10sso/<栈名>/e10-config 读取，E10 应用密钥从 Secrets Manager 读取，修改栈参数后无需重建实例
+          #   实例重建时保持不变的两样东西：
+          #     - realm 签名密钥：首次生成后存进 KcSecret（realm_signing_key/cert），之后每次配置都导入同一把
+          #     - IAM Identity Center 的 SP 元数据：register-idc-sp.sh 存在 SSM 参数 /e10sso/<栈名>/idc-sp-metadata，没指定 SP 文件时自动使用
+          cat > /opt/kc/configure.sh <<'EOF'
+          #!/bin/bash
+          set -euo pipefail
+          SP="${!1:-none}"; shift || true
+          S=$(aws secretsmanager get-secret-value --region ${AWS::Region} --secret-id '${KcSecret}' --query SecretString --output text)
+          E10_CLIENT_SECRET=$(aws secretsmanager get-secret-value --region ${AWS::Region} --secret-id '${E10Secret}' --query SecretString --output text)
+          export E10_CLIENT_SECRET
+          CFG=$(aws ssm get-parameter --region ${AWS::Region} --name '/e10sso/${AWS::StackName}/e10-config' --query Parameter.Value --output text)
+          j() { echo "$CFG" | jq -r ".$1"; }
+          EXTRA=(); ISS=$(j issuer); [ -n "$ISS" ] && EXTRA+=(--e10-issuer "$ISS")
+          if [ "$SP" = none ] && P=$(aws ssm get-parameter --region ${AWS::Region} --name '/e10sso/${AWS::StackName}/idc-sp-metadata' --query Parameter.Value --output text 2>/dev/null); then
+            printf '%s' "$P" > /opt/kc/sp-metadata.persisted.xml; SP=/opt/kc/sp-metadata.persisted.xml
+            echo "使用已登记的 IAM Identity Center SP 元数据（SSM 参数 idc-sp-metadata）"
+          fi
+          REALM_SIGNING_KEY=$(echo "$S" | jq -r '.realm_signing_key // empty')
+          REALM_SIGNING_CERT=$(echo "$S" | jq -r '.realm_signing_cert // empty')
+          export REALM_SIGNING_KEY REALM_SIGNING_CERT
+          python3 /opt/kc/setup-keycloak.py --kc http://localhost:9080 --public-url "https://$(cat /opt/kc/public-host)" \
+            --admin-pass "$(echo "$S" | jq -r .admin_password)" \
+            --e10-base "$(j base)" --e10-client-id "$(j client_id)" --e10-scopes "$(j scopes)" \
+            --email-from "$(j email_from)" --nonce "$(j nonce)" --sp-metadata "$SP" "${!EXTRA[@]}" "$@"
+          if [ -z "$REALM_SIGNING_KEY" ]; then
+            q() { docker exec kc-db psql -U keycloak -d keycloak -At -c "select cc.value from component c join realm r on r.id=c.realm_id join component_config cc on cc.component_id=c.id where r.name='corp' and c.provider_id='rsa-generated' and cc.name='$1'"; }
+            K=$(q privateKey); C=$(q certificate)
+            if [ -n "$K" ] && [ -n "$C" ]; then
+              S2=$(echo "$S" | jq -c --arg k "$K" --arg c "$C" '. + {realm_signing_key:$k, realm_signing_cert:$c}')
+              aws secretsmanager put-secret-value --region ${AWS::Region} --secret-id '${KcSecret}' --secret-string "$S2" > /dev/null
+              echo "已把 realm 签名密钥保存到 Secrets Manager（实例重建后沿用）"
+            fi
+          fi
+          EOF
+          sed -i 's/^ *//' /opt/kc/configure.sh
+          chmod 700 /opt/kc/configure.sh
+          echo "$HOST" > /opt/kc/public-host
+          /opt/kc/configure.sh none
+          report SUCCESS "keycloak ready on https://$HOST"
+
+  # 1) 公网只开放登录相关路径：管理控制台(/admin)和 master realm 一律 403
+  # 2) 写入标准的 Forwarded 头（用户真实 IP + https），Keycloak 据此判断请求是 HTTPS（cookie 才会带 Secure; SameSite=None）。
+  #    不能用 X-Forwarded-Proto：CloudFront 回源时会删掉这个头。用户自己带的 Forwarded 头会被这里覆盖，无法伪造。
+  BlockAdminFn:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub '${AWS::StackName}-block-admin'
+      AutoPublish: true
+      FunctionConfig: {Comment: block keycloak admin and master realm; set Forwarded header, Runtime: cloudfront-js-2.0}
+      FunctionCode: |
+        function handler(event) {
+          var req = event.request;
+          var uri = req.uri;
+          if (uri === '/admin' || uri.indexOf('/admin/') === 0 || uri.indexOf('/realms/master') === 0) {
+            return { statusCode: 403, statusDescription: 'Forbidden',
+                     headers: { 'content-type': { value: 'text/plain' } }, body: 'Forbidden' };
+          }
+          var ip = event.viewer.ip;
+          var forValue = ip.indexOf(':') >= 0 ? '"[' + ip + ']"' : ip;
+          req.headers['forwarded'] = { value: 'for=' + forValue + ';proto=https' };
+          return req;
+        }
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub '${AWS::StackName} keycloak'
+        Enabled: true
+        HttpVersion: http2and3
+        PriceClass: PriceClass_200
+        Origins:
+          - Id: keycloak
+            DomainName: !GetAtt Instance.PublicDnsName
+            CustomOriginConfig: {HTTPPort: 8080, OriginProtocolPolicy: http-only, OriginReadTimeout: 30}
+        DefaultCacheBehavior:
+          TargetOriginId: keycloak
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          CachedMethods: [GET, HEAD]
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad          # Managed-CachingDisabled
+          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3  # Managed-AllViewer
+          Compress: true
+          FunctionAssociations:
+            - {EventType: viewer-request, FunctionARN: !GetAtt BlockAdminFn.FunctionMetadata.FunctionARN}
+
+  PublicHostParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/e10sso/${AWS::StackName}/public-host'
+      Type: String
+      Value: !GetAtt Distribution.DomainName
+
+  Ready:
+    Type: AWS::CloudFormation::WaitCondition
+    DependsOn: PublicHostParam
+    Properties: {Handle: !Ref WaitHandle, Timeout: '2400', Count: 1}
+
+Outputs:
+  KeycloakUrl:
+    Value: !Sub 'https://${Distribution.DomainName}'
+  E10RedirectUri:
+    Description: 填到 E10 认证应用的"业务系统 URL 地址"
+    Value: !Sub 'https://${Distribution.DomainName}/realms/corp/broker/e10/endpoint'
+  DesktopIssuer:
+    Value: !Sub 'https://${Distribution.DomainName}/realms/corp'
+  DesktopAuthorizationEndpoint:
+    Value: !Sub 'https://${Distribution.DomainName}/realms/corp/protocol/openid-connect/auth'
+  DesktopTokenEndpoint:
+    Value: !Sub 'https://${Distribution.DomainName}/realms/corp/protocol/openid-connect/token'
+  DesktopJwksUri:
+    Value: !Sub 'https://${Distribution.DomainName}/realms/corp/protocol/openid-connect/certs'
+  DesktopClientId:
+    Value: amazon-quick-desktop
+  SamlIdpMetadataUrl:
+    Description: 上传到 IAM Identity Center（外部身份提供商）的 IdP 元数据
+    Value: !Sub 'https://${Distribution.DomainName}/realms/corp/protocol/saml/descriptor'
+  InstanceId:
+    Value: !Ref Instance
+  OutboundIp:
+    Description: Keycloak 访问 E10 时的出口 IP（弹性 IP，实例停止再启动后不变；客户若按来源 IP 限制 E10 端口，放行这个 IP）
+    Value: !Ref Eip
+  KcSecretArn:
+    Value: !Ref KcSecret

@@ -1,0 +1,207 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  e10sso - 模拟泛微 E10 统一认证中心（OIDC），仅用于测试 Keycloak 桥接。
+  按客户实际情况：公网 http（无 TLS）+ 20600 端口，固定弹性 IP。数据均为假数据，测试人员邮箱由参数指定。
+
+Parameters:
+  ArtifactBucket:
+    Type: String
+    Description: 存放 mock-e10 代码的 S3 桶（deploy.sh 自动创建并上传）
+  ArtifactPrefix:
+    Type: String
+    Default: e10sso
+  TestUserEmail:
+    Type: String
+    AllowedPattern: '^[^@\s]+@[^@\s]+\.[^@\s]+$'
+    Description: 测试人员邮箱，必须与 Quick 里已有用户的邮箱完全一致
+  E10Port:
+    Type: Number
+    Default: 20600
+    Description: 对外端口（客户 E10 是 http + 20600）
+  AllowedCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: 允许访问模拟 E10 的来源（客户 E10 是全公网开放）
+  InstanceType:
+    Type: String
+    Default: t4g.micro
+    AllowedValues: [t4g.micro, t4g.small]
+  NodeImage:
+    Type: String
+    Default: public.ecr.aws/docker/library/node:24-alpine
+  VpcCidr:
+    Type: String
+    Default: 10.88.0.0/24
+  AmiId:
+    Type: AWS::EC2::Image::Id
+    Description: >-
+      Amazon Linux 2023 arm64 AMI。deploy.sh 新建栈时取最新版，更新栈时沿用当前实例的 AMI，避免更新栈时实例被替换。
+      手工部署可用 aws ssm get-parameter --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64 查询
+
+Resources:
+  # ---------------- 网络：独立 VPC，一个公有子网，固定弹性 IP ----------------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-vpc'}]
+  Igw:
+    Type: AWS::EC2::InternetGateway
+  IgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: {VpcId: !Ref Vpc, InternetGatewayId: !Ref Igw}
+  Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref VpcCidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}-public'}]
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: {VpcId: !Ref Vpc}
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttach
+    Properties: {RouteTableId: !Ref RouteTable, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref Igw}
+  SubnetRoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: {SubnetId: !Ref Subnet, RouteTableId: !Ref RouteTable}
+  InstanceSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: mock-e10 - http on E10Port, like customer E10
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - {IpProtocol: tcp, FromPort: !Ref E10Port, ToPort: !Ref E10Port, CidrIp: !Ref AllowedCidr}
+  Eip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}'}]
+  Eni:
+    Type: AWS::EC2::NetworkInterface
+    Properties: {SubnetId: !Ref Subnet, GroupSet: [!Ref InstanceSg]}
+  EipAssoc:
+    Type: AWS::EC2::EIPAssociation
+    DependsOn: IgwAttach
+    Properties: {AllocationId: !GetAtt Eip.AllocationId, NetworkInterfaceId: !Ref Eni}
+
+  # ---------------- 密钥：首次启动时由实例随机生成 ----------------
+  Secret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: !Sub '${AWS::StackName} - 模拟 E10 的管理令牌、测试人员密码、两个认证应用的 client_secret（实例首次启动时生成）'
+      SecretString: '{"initialized":false}'
+
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: sts:AssumeRole}]
+      ManagedPolicyArns: [!Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore']
+      Policies:
+        - PolicyName: e10sso-mock
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - {Effect: Allow, Action: s3:GetObject, Resource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/${ArtifactPrefix}/mock-e10/*'}
+              - {Effect: Allow, Action: s3:ListBucket, Resource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucket}',
+                 Condition: {StringLike: {'s3:prefix': !Sub '${ArtifactPrefix}/mock-e10/*'}}}
+              - {Effect: Allow, Action: [secretsmanager:GetSecretValue, secretsmanager:PutSecretValue], Resource: !Ref Secret}
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: {Roles: [!Ref Role]}
+
+  WaitHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+
+  Instance:
+    Type: AWS::EC2::Instance
+    DependsOn: [DefaultRoute, EipAssoc]
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      MetadataOptions: {HttpTokens: required, HttpEndpoint: enabled}
+      NetworkInterfaces:
+        - {DeviceIndex: '0', NetworkInterfaceId: !Ref Eni}
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs: {VolumeSize: 16, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true}
+      Tags: [{Key: Name, Value: !Sub '${AWS::StackName}'}]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+          exec > /var/log/e10sso-bootstrap.log 2>&1
+          REGION=${AWS::Region}
+          HANDLE='${WaitHandle}'
+          BASE='http://${Eip}:${E10Port}'
+          report() { curl -s -X PUT -H 'Content-Type:' --data-binary "{\"Status\":\"$1\",\"Reason\":\"$2\",\"UniqueId\":\"mock-e10\",\"Data\":\"$2\"}" "$HANDLE"; }
+          trap 'report FAILURE "bootstrap failed at line $LINENO, see /var/log/e10sso-bootstrap.log"; exit 1' ERR
+
+          dnf install -y docker jq
+          systemctl enable --now docker
+          docker pull ${NodeImage}
+
+          # 随机生成并保存密钥（只在第一次；实例重建时沿用，Keycloak 里的应用密钥不用改）
+          SID='${Secret}'
+          S=$(aws secretsmanager get-secret-value --region $REGION --secret-id "$SID" --query SecretString --output text)
+          if [ "$(echo "$S" | jq -r .initialized)" != "true" ]; then
+            S=$(jq -cn --arg a "$(openssl rand -hex 24)" --arg p "E10-$(openssl rand -hex 8)" \
+                       --arg b "$(openssl rand -hex 16)" --arg d "$(openssl rand -hex 16)" \
+                 '{initialized:true, admin_token:$a, user_password:$p, broker_client_secret:$b, direct_client_secret:$d}')
+            aws secretsmanager put-secret-value --region $REGION --secret-id "$SID" --secret-string "$S" > /dev/null
+          fi
+          v() { echo "$S" | jq -r ".$1"; }
+
+          mkdir -p /opt/mock-e10/data
+          aws s3 cp --region $REGION --recursive s3://${ArtifactBucket}/${ArtifactPrefix}/mock-e10/ /opt/mock-e10/
+          umask 077
+          python3 /opt/mock-e10/make-cloud-config.py --src /opt/mock-e10/config.json --out /opt/mock-e10/config.cloud.json \
+            --password "$(v user_password)" --broker-secret "$(v broker_client_secret)" \
+            --direct-secret "$(v direct_client_secret)" --test-email '${TestUserEmail}'
+          # 管理接口 /__mock/* 只接受本机请求（公网是 http，令牌不在公网上传）；容器用 host 网络以便识别本机来源
+          printf 'PORT=%s\nE10_PUBLIC_BASE=%s\nE10_CONFIG=/app/config.cloud.json\nMOCK_ADMIN_TOKEN=%s\nMOCK_ADMIN_LOCAL_ONLY=true\n' \
+            '${E10Port}' "$BASE" "$(v admin_token)" > /opt/mock-e10/env
+
+          docker rm -f mock-e10 > /dev/null 2>&1 || true
+          docker run -d --name mock-e10 --restart unless-stopped --network host \
+            -v /opt/mock-e10:/app -w /app --env-file /opt/mock-e10/env ${NodeImage} node server.js
+          for i in $(seq 1 30); do curl -sf -o /dev/null http://127.0.0.1:${E10Port}/papi/sso/oidc/.well-known/openid-configuration && break; sleep 2; done
+          curl -sf -o /dev/null http://127.0.0.1:${E10Port}/papi/sso/oidc/.well-known/openid-configuration
+          report SUCCESS "mock e10 ready on $BASE"
+
+  Ready:
+    Type: AWS::CloudFormation::WaitCondition
+    DependsOn: Instance
+    Properties: {Handle: !Ref WaitHandle, Timeout: '1800', Count: 1}
+
+Outputs:
+  E10BaseUrl:
+    Value: !Sub 'http://${Eip}:${E10Port}'
+  Issuer:
+    Value: !Sub 'http://${Eip}:${E10Port}'
+  DiscoveryUrl:
+    Value: !Sub 'http://${Eip}:${E10Port}/papi/sso/oidc/.well-known/openid-configuration'
+  PublicIp:
+    Value: !Ref Eip
+  BrokerClientId:
+    Description: 给 Keycloak 用的认证应用标识（应用密钥在 SecretArn 的 broker_client_secret）
+    Value: 9c5a07c0e2ad40229cc73306b6996f6b
+  DirectClientId:
+    Description: 对应联调测试 B 的直连测试应用（应用密钥在 SecretArn 的 direct_client_secret，回调 http://localhost:18080）
+    Value: 3f1e2d4c5b6a47988796a5b4c3d2e1f0
+  TestLoginId:
+    Description: 测试人员登录名（密码在 SecretArn 的 user_password）
+    Value: quicktest
+  TestUserEmail:
+    Value: !Ref TestUserEmail
+  SecretArn:
+    Value: !Ref Secret
+  InstanceId:
+    Value: !Ref Instance

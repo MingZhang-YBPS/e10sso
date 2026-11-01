@@ -1,0 +1,45 @@
+{
+  "_comment": "模拟 E10 统一认证中心的数据模板（假数据）。部署时 make-cloud-config.py 会替换密码和应用密钥、加入测试人员；public_base 由环境变量 E10_PUBLIC_BASE 覆盖；Keycloak 的回调地址由 deploy.sh 经管理接口写入。",
+  "public_base": "http://<部署时设置>:20600",
+  "users": [
+    {"loginid": "zhangsan", "password": "<部署时替换为随机密码>", "name": "张三", "email": "zhangsan@corp.example", "mobile": "13800000001", "job_num": "E0001", "id": "1156444318578573391"},
+    {"loginid": "lisi",     "password": "<部署时替换为随机密码>", "name": "李四", "email": "lisi@corp.example",     "mobile": "13800000002", "job_num": "E0002", "id": "1156444318578573392"},
+    {"loginid": "wangwu",   "password": "<部署时替换为随机密码>", "name": "王五", "email": "",                      "mobile": "13800000003", "job_num": "E0003", "id": "1156444318578573393"}
+  ],
+  "apps": [
+    {
+      "name": "Keycloak-桥接",
+      "enabled": true,
+      "client_id": "9c5a07c0e2ad40229cc73306b6996f6b",
+      "client_secret": "<部署时替换为随机值>",
+      "business_urls": [],
+      "account_mapping": "email",
+      "share_scope": ["zhangsan", "wangwu"],
+      "scopes": {
+        "profile": {"system": true, "claims": {"username": "name"}},
+        "job_num": {"system": true, "claims": {"job_num": "job_num"}},
+        "email":   {"system": false, "claims": {"email": "email"}}
+      }
+    },
+    {
+      "name": "Quick-Desktop-直连测试（对应联调测试 B，用来对比不加 Keycloak 的情况）",
+      "enabled": true,
+      "client_id": "3f1e2d4c5b6a47988796a5b4c3d2e1f0",
+      "client_secret": "<部署时替换为随机值>",
+      "business_urls": ["http://localhost:18080"],
+      "account_mapping": "email",
+      "share_scope": ["zhangsan"],
+      "scopes": {
+        "profile": {"system": true, "claims": {"username": "name"}},
+        "email":   {"system": false, "claims": {"email": "email"}}
+      }
+    }
+  ],
+  "lifetimes": {
+    "code_seconds": 60,
+    "code_max_uses": 1,
+    "access_token_seconds": 7200,
+    "id_token_seconds": 28800,
+    "refresh_token_seconds": 432000
+  }
+}

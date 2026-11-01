@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- 模拟 IAM Identity Center 的 SP 元数据（结构同 AWS 控制台下载的文件；实例 ID、ACS 路径为虚构值）。
+     正式部署时换成从 IAM Identity Center → Settings → Identity source → Change identity source 下载的真实文件。 -->
+<md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" entityID="https://us-east-1.signin.aws.amazon.com/platform/saml/d-9067000000">
+  <md:SPSSODescriptor WantAssertionsSigned="true" AuthnRequestsSigned="false" protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol">
+    <md:NameIDFormat>urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress</md:NameIDFormat>
+    <md:AssertionConsumerService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST" Location="https://us-east-1.signin.aws.amazon.com/platform/saml/acs/0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d" index="0" isDefault="true"/>
+  </md:SPSSODescriptor>
+</md:EntityDescriptor>

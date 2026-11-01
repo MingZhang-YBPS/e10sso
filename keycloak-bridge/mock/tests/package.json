@@ -1,0 +1,10 @@
+{
+  "name": "e10-keycloak-bridge-tests",
+  "private": true,
+  "description": "模拟 E10 + Keycloak 桥接方案的自动化验证",
+  "dependencies": {
+    "@xmldom/xmldom": "^0.9.8",
+    "playwright": "1.64.1",
+    "xml-crypto": "^6.1.2"
+  }
+}
